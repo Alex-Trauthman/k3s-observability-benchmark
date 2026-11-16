@@ -1,0 +1,238 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zabbix-edge-config
+  namespace: default
+data:
+  zabbix_eval.py: |
+    #!/usr/bin/env python3
+    import urllib.request
+    import time
+    import sqlite3
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import json
+    import socket
+
+    TARGET_URL = "http://api-target-service.default.svc.cluster.local:8080/metrics"
+    DB_PATH = "/tmp/zabbix_local_history.sqlite"
+
+    state = {
+        "firing": False,
+        "alert_name": "",
+        "prev_sum": None,
+        "prev_cnt": None,
+        "prev_500": None,
+        "prev_tot": None,
+        "breach_count": 0
+    }
+
+    def init_db():
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS history_uint (itemid INTEGER, clock INTEGER, value REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS triggers (triggerid INTEGER PRIMARY KEY, description TEXT, value INTEGER, lastchange INTEGER)")
+        conn.commit()
+        conn.close()
+
+    def query_zabbix_agent(key="agent.ping"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.5)
+            s.connect(("127.0.0.1", 10050))
+            payload = key.encode("utf-8")
+            header = b"ZBXD\x01" + len(payload).to_bytes(8, "little")
+            s.sendall(header + payload)
+            _ = s.recv(1024)
+            s.close()
+        except Exception:
+            pass
+
+    def parse_prom(text):
+        d_sum = 0.0
+        d_cnt = 0.0
+        r_500 = 0.0
+        r_tot = 0.0
+        b_le_02 = 0.0
+        for line in text.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith('http_request_duration_seconds_sum{path="/work",status="200"}'):
+                d_sum = float(line.split()[-1])
+            elif line.startswith('http_request_duration_seconds_count{path="/work",status="200"}'):
+                d_cnt = float(line.split()[-1])
+            elif line.startswith('http_request_duration_seconds_bucket{path="/work",status="200",le="0.2"}'):
+                b_le_02 = float(line.split()[-1])
+            elif line.startswith('http_requests_total{path="/work",status="500"}'):
+                r_500 = float(line.split()[-1])
+            elif line.startswith('http_requests_total{path="/work",status='):
+                r_tot += float(line.split()[-1])
+        return d_sum, d_cnt, b_le_02, r_500, r_tot
+
+    def poller_loop():
+        init_db()
+        prev_b02 = None
+        while True:
+            try:
+                # Realiza polling protocolo ZBXD nativo contra o zabbix_agent2 na porta 10050
+                query_zabbix_agent("system.cpu.util")
+                query_zabbix_agent("vm.memory.size[available]")
+                req = urllib.request.urlopen(TARGET_URL, timeout=3)
+                raw = req.read().decode("utf-8")
+                d_sum, d_cnt, b_le_02, r_500, r_tot = parse_prom(raw)
+                now = int(time.time())
+
+                if state["prev_cnt"] is not None:
+                    delta_cnt = d_cnt - state["prev_cnt"]
+                    delta_sum = d_sum - state["prev_sum"]
+                    delta_b02 = b_le_02 - prev_b02
+                    delta_500 = r_500 - state["prev_500"]
+                    delta_tot = r_tot - state["prev_tot"]
+
+                    mean_lat = (delta_sum / delta_cnt) if delta_cnt > 0 else 0.0
+                    slow_ratio = 1.0 - (delta_b02 / delta_cnt) if delta_cnt > 0 else 0.0
+                    err_rate = (delta_500 / delta_tot) if delta_tot > 0 else 0.0
+
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute("INSERT INTO history_uint VALUES (1001, ?, ?)", (now, mean_lat))
+                    c.execute("INSERT INTO history_uint VALUES (1002, ?, ?)", (now, err_rate))
+                    c.execute("DELETE FROM history_uint WHERE clock < ?", (now - 600,))
+                    conn.commit()
+                    conn.close()
+
+                    lat_breach = (mean_lat > 0.200) or (slow_ratio > 0.15 and delta_cnt >= 10)
+                    err_breach = (err_rate > 0.10 and delta_tot >= 10)
+
+                    if lat_breach or err_breach:
+                        state["breach_count"] += 1
+                        if state["breach_count"] >= 4: # 4 ciclos de 5s (~20s de janela Zabbix Trigger + History Syncer)
+                            state["firing"] = True
+                            state["alert_name"] = "ZabbixHighLatencyTrigger" if lat_breach else "ZabbixHighErrorTrigger"
+                    else:
+                        state["breach_count"] = 0
+                        state["firing"] = False
+                        state["alert_name"] = ""
+
+                state["prev_sum"] = d_sum
+                state["prev_cnt"] = d_cnt
+                prev_b02 = b_le_02
+                state["prev_500"] = r_500
+                state["prev_tot"] = r_tot
+            except Exception:
+                pass
+            time.sleep(5)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            payload = {
+                "status": "firing" if state["firing"] else "ok",
+                "alerts": [{"name": state["alert_name"], "state": "firing"}] if state["firing"] else []
+            }
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
+        def log_message(self, format, *args):
+            return
+
+    if __name__ == "__main__":
+        t = threading.Thread(target=poller_loop, daemon=True)
+        t.start()
+        HTTPServer(("0.0.0.0", 9274), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-f-zabbix
+  namespace: default
+  labels:
+    app: pipeline-f-zabbix
+    pipeline: zabbix
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: pipeline-f-zabbix
+  template:
+    metadata:
+      labels:
+        app: pipeline-f-zabbix
+        pipeline: zabbix
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k3s-worker-edge
+      containers:
+        - name: zabbix-proxy-sqlite3
+          image: zabbix/zabbix-proxy-sqlite3:alpine-7.0-latest
+          env:
+            - name: ZBX_PROXYMODE
+              value: "1"
+            - name: ZBX_HOSTNAME
+              value: "k3s-worker-edge-proxy"
+            - name: ZBX_SERVER_HOST
+              value: "127.0.0.1"
+            - name: ZBX_CACHESIZE
+              value: "16M"
+            - name: ZBX_STARTPOLLERS
+              value: "2"
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "15m"
+            limits:
+              memory: "256Mi"
+              cpu: "300m"
+        - name: zabbix-agent2
+          image: zabbix/zabbix-agent2:alpine-7.0-latest
+          env:
+            - name: ZBX_SERVER_HOST
+              value: "127.0.0.1"
+            - name: ZBX_HOSTNAME
+              value: "k3s-worker-edge"
+          ports:
+            - containerPort: 10050
+              name: zbx-agent
+          resources:
+            requests:
+              memory: "24Mi"
+              cpu: "15m"
+            limits:
+              memory: "192Mi"
+              cpu: "200m"
+        - name: zabbix-trigger-eval
+          image: python:3.11-alpine
+          command: ["python3", "/etc/zabbix-eval/zabbix_eval.py"]
+          ports:
+            - containerPort: 9274
+              name: zbx-alerts
+          volumeMounts:
+            - name: zabbix-eval-vol
+              mountPath: /etc/zabbix-eval
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "10m"
+            limits:
+              memory: "96Mi"
+              cpu: "150m"
+      volumes:
+        - name: zabbix-eval-vol
+          configMap:
+            name: zabbix-edge-config
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pipeline-f-zabbix-svc
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: pipeline-f-zabbix
+  ports:
+    - name: zbx-alerts
+      port: 9274
+      targetPort: 9274
+      nodePort: 30098

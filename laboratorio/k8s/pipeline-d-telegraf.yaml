@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: telegraf-config
+data:
+  telegraf.conf: |
+    [agent]
+      interval = "10s"
+      round_interval = true
+      metric_batch_size = 1000
+      metric_buffer_limit = 10000
+      collection_jitter = "0s"
+      flush_interval = "5s"
+      flush_jitter = "0s"
+      omit_hostname = false
+
+    [[inputs.prometheus]]
+      urls = ["http://api-target-service:8080/metrics"]
+      metric_version = 1
+
+    [[processors.starlark]]
+      script = "/etc/telegraf/alert_eval.star"
+
+    [[outputs.health]]
+      service_address = "http://:8880"
+      namepass = ["edge_alert_status"]
+      [[outputs.health.compares]]
+        field = "firing"
+        lt = 1.0
+
+    [[outputs.file]]
+      files = ["/dev/null"]
+
+  alert_eval.star: |
+    state = {
+        "initialized": False,
+        "prev_total": 0.0,
+        "prev_err": 0.0,
+        "prev_b02": 0.0,
+        "prev_bcount": 0.0,
+        "violation_since": 0,
+        "cur_total": 0.0,
+        "cur_err": 0.0,
+        "cur_b02": 0.0,
+        "cur_bcount": 0.0,
+    }
+
+    def apply(metric):
+        name = metric.name
+        if name == "http_requests_total":
+            st = metric.tags.get("status", "")
+            val = float(metric.fields.get("counter", 0.0))
+            if st == "500":
+                state["cur_err"] = val
+            elif st == "200":
+                state["cur_total"] = val
+        elif name == "http_request_duration_seconds":
+            st = metric.tags.get("status", "200")
+            if st == "200":
+                state["cur_b02"] = float(metric.fields.get("0.2", 0.0))
+                state["cur_bcount"] = float(metric.fields.get("count", 0.0))
+        elif name == "process_start_time_seconds":
+            if not state["initialized"]:
+                state["prev_bcount"] = state["cur_bcount"]
+                state["prev_b02"] = state["cur_b02"]
+                state["prev_total"] = state["cur_total"]
+                state["prev_err"] = state["cur_err"]
+                state["initialized"] = True
+                alert_m = Metric("edge_alert_status")
+                alert_m.fields["firing"] = 0
+                return [metric, alert_m]
+
+            d_cnt = state["cur_bcount"] - state["prev_bcount"]
+            d_b02 = state["cur_b02"] - state["prev_b02"]
+            d_ok = state["cur_total"] - state["prev_total"]
+            d_err = state["cur_err"] - state["prev_err"]
+            d_all = d_ok + d_err
+
+            state["prev_bcount"] = state["cur_bcount"]
+            state["prev_b02"] = state["cur_b02"]
+            state["prev_total"] = state["cur_total"]
+            state["prev_err"] = state["cur_err"]
+
+            high_lat = False
+            if d_cnt >= 5.0 and (d_b02 / d_cnt) < 0.95:
+                high_lat = True
+
+            high_err = False
+            if d_all >= 5.0 and (d_err / d_all) > 0.10:
+                high_err = True
+
+            if high_lat or high_err:
+                state["violation_since"] += 1
+            else:
+                state["violation_since"] = 0
+
+            firing = 1 if state["violation_since"] >= 2 else 0
+            alert_m = Metric("edge_alert_status")
+            alert_m.fields["firing"] = firing
+            return [metric, alert_m]
+        return metric
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-d-telegraf
+  labels:
+    app: pipeline-d-telegraf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pipeline-d-telegraf
+  template:
+    metadata:
+      labels:
+        app: pipeline-d-telegraf
+    spec:
+      containers:
+      - name: telegraf
+        image: telegraf:1.30-alpine
+        args:
+          - "--config=/etc/telegraf/telegraf.conf"
+        ports:
+        - containerPort: 8880
+          name: health
+        resources:
+          requests:
+            cpu: "20m"
+            memory: "32Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+        volumeMounts:
+        - name: telegraf-config-vol
+          mountPath: /etc/telegraf
+      volumes:
+      - name: telegraf-config-vol
+        configMap:
+          name: telegraf-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: telegraf-service
+spec:
+  type: NodePort
+  selector:
+    app: pipeline-d-telegraf
+  ports:
+    - name: health
+      protocol: TCP
+      port: 8880
+      targetPort: 8880
+      nodePort: 30096

@@ -1,0 +1,23 @@
+# Imagens de infraestrutura e pacotes históricos
+*.iso
+*.iso.gz
+*.ova
+*.mp4
+*.zip
+*.tar.gz
+*.tar
+*.bundle
+laboratorio/app/api-target
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.swp
+*~
+.#*
+.~lock.*
+
+# Evidências brutas mantidas no acervo local
+/laboratorio/logs/benchmarks/
+/laboratorio/logs/k6/
+/laboratorio/logs/cluster_evidence/

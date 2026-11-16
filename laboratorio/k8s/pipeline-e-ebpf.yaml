@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-e-ebpf
+  labels:
+    app: pipeline-e-ebpf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pipeline-e-ebpf
+  template:
+    metadata:
+      labels:
+        app: pipeline-e-ebpf
+    spec:
+      hostPID: true
+      containers:
+      - name: beyla-ebpf
+        image: grafana/beyla:1.8.0
+        securityContext:
+          privileged: true
+        env:
+        - name: BEYLA_EXECUTABLE_NAME
+          value: "api-target"
+        - name: BEYLA_PROMETHEUS_PORT
+          value: "8999"
+        ports:
+        - containerPort: 8999
+          name: metrics
+        resources:
+          requests:
+            cpu: "30m"
+            memory: "48Mi"
+          limits:
+            cpu: "300m"
+            memory: "192Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ebpf-service
+spec:
+  type: NodePort
+  selector:
+    app: pipeline-e-ebpf
+  ports:
+    - name: metrics
+      protocol: TCP
+      port: 8999
+      targetPort: 8999
+      nodePort: 30097
